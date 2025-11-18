@@ -669,3 +669,200 @@ function Send-TestEmail {
         }
     }
 }   #  
+
+
+
+# ================================
+# Main Processing
+# ================================
+
+try {
+    # Display configuration
+    Write-Log "=== Graph Email Replay Configuration ===" -Level Info
+    Write-Log "Tenant ID: $TenantId" -Level Info
+    Write-Log "Client ID: $ClientId" -Level Info
+    Write-Log "Target Mailbox: $TargetMailbox" -Level Info
+    Write-Log "Replay Mode: $ReplayMode" -Level Info
+    Write-Log "Source Mailboxes: $($SourceMailboxes -join ', ')" -Level Info
+    
+    if ($AttachmentsOnly) {
+        Write-Log "Filter: Attachments Only" -Level Info
+    }
+    
+    if ($StartDate -or $EndDate) {
+        Write-Log "Date Range: $StartDate to $EndDate" -Level Info
+    }
+    
+    if ($SubjectFilter) {
+        Write-Log "Subject Filter: $SubjectFilter" -Level Info
+    }
+    
+    if ($BccAlways) {
+        Write-Log "BCC Always: $($BccAlways -join ', ')" -Level Info
+    }
+    
+    if ($WhatIf) {
+        Write-Log "*** WHATIF MODE - No emails will be sent ***" -Level Warning
+    }
+    
+    # Test mode
+    if ($TestMode) {
+        $testSource = if ($TestMailbox) { $TestMailbox } else { $SourceMailboxes[0] }
+        Write-Log "Running in TEST MODE - Sending test email only" -Level Warning
+        
+        if (Send-TestEmail -TestMailbox $testSource -TargetMailbox $TargetMailbox) {
+            Write-Log "Test completed successfully" -Level Success
+        }
+        else {
+            Write-Log "Test failed" -Level Error
+        }
+        
+        return
+    }
+    
+    # Process each source mailbox
+    foreach ($sourceMailbox in $SourceMailboxes) {
+        Write-Log "`nProcessing mailbox: $sourceMailbox" -Level Info
+        
+        try {
+            # Get messages
+            $messages = Get-MailboxMessages `
+                -Mailbox $sourceMailbox `
+                -Folder $FolderName `
+                -StartDate $StartDate `
+                -EndDate $EndDate `
+                -SubjectFilter $SubjectFilter `
+                -HasAttachments:$AttachmentsOnly `
+                -Top $BatchSize
+            
+            if ($messages.Count -eq 0) {
+                Write-Log "No messages found in $sourceMailbox/$FolderName" -Level Warning
+                continue
+            }
+            
+            Write-Log "Processing $($messages.Count) messages from $sourceMailbox" -Level Info
+            
+            foreach ($message in $messages) {
+                # Check if already processed
+                if (Test-AlreadyProcessed -Message $message) {
+                    Write-Log "Skipping (already processed): $($message.subject)" -Level Info
+                    $skippedCount++
+                    continue
+                }
+                
+                # Check max messages limit
+                if ($MaxMessages -and $processedCount -ge $MaxMessages) {
+                    Write-Log "Reached maximum message limit ($MaxMessages)" -Level Warning
+                    break
+                }
+                
+                # Display what we're doing
+                $action = if ($WhatIf) { "[WHATIF]" } else { "[SENDING]" }
+                Write-Log "$action $($message.subject) (from: $($message.from.emailAddress.address))" -Level Info
+                
+                if (-not $WhatIf) {
+                    try {
+                        # Send based on mode
+                        $sentId = if ($ReplayMode -eq "Transparent") {
+                            Send-TransparentReplay `
+                                -SourceMailbox $sourceMailbox `
+                                -MessageId $message.id `
+                                -TargetMailbox $TargetMailbox `
+                                -BccAddresses $BccAlways
+                        }
+                        else {
+                            Send-WrapperReplay `
+                                -SourceMailbox $sourceMailbox `
+                                -Message $message `
+                                -TargetMailbox $TargetMailbox `
+                                -BccAddresses $BccAlways
+                        }
+                        
+                        $processedCount++
+                        
+                        # Log success
+                        if ($LogSuccessful) {
+                            $logEntry = @{
+                                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                                SourceMailbox = $sourceMailbox
+                                MessageId     = $message.id
+                                Subject       = $message.subject
+                                From          = $message.from.emailAddress.address
+                                ReceivedDate  = $message.receivedDateTime
+                                TargetMailbox = $TargetMailbox
+                                ReplayMode    = $ReplayMode
+                                SentId        = $sentId
+                            }
+                            
+                            $logEntry | ConvertTo-Json -Compress | Add-Content -Path $logFile
+                        }
+                        
+                        Write-Log "Successfully sent: $($message.subject)" -Level Success
+                        
+                        # Throttle
+                        if ($ThrottleMs -gt 0) {
+                            Start-Sleep -Milliseconds $ThrottleMs
+                        }
+                    }
+                    catch {
+                        $errorCount++
+                        Write-Log "Failed to send: $($message.subject) - Error: $_" -Level Error
+                        
+                        # Log error
+                        if ($LogPath) {
+                            $logBase = [IO.Path]::GetFileNameWithoutExtension($logFile)
+                            $logDir  = [IO.Path]::GetDirectoryName($logFile)
+                            $errorLogFile = Join-Path $logDir ($logBase + "_errors.log")
+
+                            $errorEntry = @{
+                                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                                SourceMailbox = $sourceMailbox
+                                MessageId     = $message.id
+                                Subject       = $message.subject
+                                Error         = $_.ToString()
+                            }
+                            
+                            $errorEntry | ConvertTo-Json -Compress | Add-Content -Path $errorLogFile
+                        }
+                    }
+                }
+                else {
+                    $processedCount++
+                }
+            }
+        }
+        catch {
+            Write-Log "Error processing mailbox $sourceMailbox : $_" -Level Error
+        }
+    }
+    
+    # Final summary
+    Write-Log "`n========================================" -Level Info
+    Write-Log "Processing Complete" -Level Success
+    Write-Log "========================================" -Level Info
+    Write-Log "Processed: $processedCount messages" -Level Info
+    Write-Log "Skipped: $skippedCount messages" -Level Info
+    Write-Log "Errors: $errorCount messages" -Level Info
+    
+    if ($LogPath -and $LogSuccessful) {
+        Write-Log "Log file: $logFile" -Level Info
+    }
+}
+catch {
+    Write-Log "Fatal error: $_" -Level Error
+    throw
+}
+finally {
+    # Cleanup
+    if ($LogPath) {
+        $footer = @"
+========================================
+Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Total Processed: $processedCount
+Total Errors: $errorCount
+Total Skipped: $skippedCount
+========================================
+"@
+        Add-Content -Path $logFile -Value $footer -ErrorAction SilentlyContinue
+    }
+}
