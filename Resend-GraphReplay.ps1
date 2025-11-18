@@ -438,7 +438,7 @@ Resent-From: $SourceMailbox
 Resent-To: $TargetMailbox
 Auto-Submitted: auto-generated
 X-Resent-Via: GraphAPI/TransparentReplay
-$ProcessedHeader: true
+$($ProcessedHeader): true
 
 "@
     
