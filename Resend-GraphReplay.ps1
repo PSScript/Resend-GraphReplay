@@ -716,7 +716,14 @@ function Send-WrapperReplay {
     }) -join ", "
 
     # FIX: Use locale-safe datetime parsing
-    $receivedTime = ([datetime]::Parse($Message.receivedDateTime, [System.Globalization.CultureInfo]::InvariantCulture)).ToString("dd.MM.yyyy HH:mm")
+  $formats = @("yyyy-MM-ddTHH:mm:ssZ", "MM/dd/yyyy HH:mm:ss", "dd.MM.yyyy HH:mm:ss")
+$culture = [System.Globalization.CultureInfo]::InvariantCulture
+try {
+    $receivedTime = [datetime]::ParseExact($Message.receivedDateTime, $formats, $culture, [System.Globalization.DateTimeStyles]::AssumeUniversal)
+    $receivedStr = $receivedTime.ToString("dd.MM.yyyy HH:mm")
+} catch {
+    $receivedStr = $Message.receivedDateTime # fallback
+}
 
     $renderedOriginalBody =
         if ($bodyType -eq "HTML") { $originalBody }
