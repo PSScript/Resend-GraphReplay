@@ -297,16 +297,28 @@ function Invoke-GraphRequest {
             return Invoke-RestMethod @params
         }
     }
-    catch {
-        if ($_.Exception.Response.StatusCode -eq 429) {
-            # Handle throttling
-            $retryAfter = $_.Exception.Response.Headers["Retry-After"]
+   catch {
+        $err = $_
+        $resp = $null
+        if ($err.Exception -and $err.Exception.Response) {
+            $resp = $err.Exception.Response
+        }
+
+        $status = $null
+        if ($resp) {
+            try { $status = $resp.StatusCode } catch {}
+        }
+
+        if ($status -eq 429) {
+            $retryAfter = $null
+            try { $retryAfter = $resp.Headers["Retry-After"] } catch {}
             $waitTime = if ($retryAfter) { [int]$retryAfter } else { 60 }
             Write-Log "Throttled. Waiting $waitTime seconds..." -Level Warning
             Start-Sleep -Seconds $waitTime
             return Invoke-GraphRequest @PSBoundParameters
         }
-        throw
+
+        throw $err
     }
 }
 
@@ -421,71 +433,52 @@ function Send-TransparentReplay {
         [string[]]$BccAddresses
     )
     
-    # Get MIME content
+    # 1) Get original MIME
     $mimeContent = Get-MessageMimeContent -Mailbox $SourceMailbox -MessageId $MessageId
-    
-    if (!$mimeContent) {
-        throw "Could not retrieve MIME content"
+    if (-not $mimeContent) {
+        throw "Could not retrieve MIME content for message $MessageId"
     }
-    
-    # Convert to base64
-    $mimeBytes = [System.Text.Encoding]::UTF8.GetBytes($mimeContent)
-    
-    # Add resent headers
-    $headers = @"
+
+    # 2) Build resent headers + processed header
+    $additionalHeaders = @"
 Resent-Date: $(Get-Date -Format 'r')
 Resent-From: $SourceMailbox
 Resent-To: $TargetMailbox
 Auto-Submitted: auto-generated
 X-Resent-Via: GraphAPI/TransparentReplay
-$($ProcessedHeader): true
+${ProcessedHeader}: true
 
 "@
-    
-    $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($headers)
-    $combinedBytes = $headerBytes + $mimeBytes
-    $mimeBase64 = [Convert]::ToBase64String($combinedBytes)
-    
-    # Send using Graph API raw send
+
+    # Prepend our headers to the original MIME
+    $finalMime = $additionalHeaders + $mimeContent
+
+    # NOTE:
+    # This leaves the original To/Cc/Bcc in place. Graph will deliver to those.
+    # If you want ONLY the TargetMailbox to receive, you'd also need to rewrite
+    # the To:/Cc:/Bcc: lines in $finalMime here.
+
+    # 3) Convert MIME to bytes and base64 encode (required by Graph)
+    $mimeBytes  = [System.Text.Encoding]::UTF8.GetBytes($finalMime)
+    $mimeBase64 = [Convert]::ToBase64String($mimeBytes)
+
+    # 4) Send via /sendMail with MIME body
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/sendMail"
-    
-    $body = @{
-        message = @{
-            internetMessageId = "<replay-$(New-Guid)@graphreplay>"
-        }
-    }
-    
-    # Use MIME format
-    $mimeBody = @"
-{
-    "message": {
-        "@odata.type": "#microsoft.graph.message"
-    },
-    "saveToSentItems": false
-}
-"@
-    
-    # Actually, for raw MIME we need different approach
-    # Using the /messages endpoint with MIME
-    $createUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
-    
+
     $token = Get-GraphToken
     $headers = @{
         "Authorization" = "Bearer $token"
-        "Content-Type" = "text/plain"
-        "Prefer" = "IdType='ImmutableId'"
+        "Content-Type"  = "text/plain"
     }
-    
-    # Create message from MIME
-    $response = Invoke-WebRequest -Method POST -Uri $createUri -Headers $headers -Body $mimeContent
-    $createdMessage = $response.Content | ConvertFrom-Json
-    
-    # Send the created message
-    $sendUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)/send"
-    Invoke-GraphRequest -Uri $sendUri -Method POST
-    
-    return $createdMessage.id
+
+    # For MIME, the body is just the base64 string, not JSON
+    $null = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeBase64
+
+    # sendMail with MIME returns 202, no body. Return a synthetic ID for logging.
+    return "mime-" + ([guid]::NewGuid().ToString())
 }
+
+
 
 function Send-WrapperReplay {
     param(
@@ -641,199 +634,38 @@ function Send-TestEmail {
         return $true
     }
     catch {
-        Write-Log "Failed to send test email: $_" -Level Error
-        return $false
-    }
-}
+        $errorCount++
+        $err = $_
 
-# ================================
-# Main Processing
-# ================================
+        $msg = "Failed to send: $($message.subject) - Error: $err"
 
-try {
-    # Display configuration
-    Write-Log "=== Graph Email Replay Configuration ===" -Level Info
-    Write-Log "Tenant ID: $TenantId" -Level Info
-    Write-Log "Client ID: $ClientId" -Level Info
-    Write-Log "Target Mailbox: $TargetMailbox" -Level Info
-    Write-Log "Replay Mode: $ReplayMode" -Level Info
-    Write-Log "Source Mailboxes: $($SourceMailboxes -join ', ')" -Level Info
-    
-    if ($AttachmentsOnly) {
-        Write-Log "Filter: Attachments Only" -Level Info
-    }
-    
-    if ($StartDate -or $EndDate) {
-        Write-Log "Date Range: $StartDate to $EndDate" -Level Info
-    }
-    
-    if ($SubjectFilter) {
-        Write-Log "Subject Filter: $SubjectFilter" -Level Info
-    }
-    
-    if ($BccAlways) {
-        Write-Log "BCC Always: $($BccAlways -join ', ')" -Level Info
-    }
-    
-    if ($WhatIf) {
-        Write-Log "*** WHATIF MODE - No emails will be sent ***" -Level Warning
-    }
-    
-    # Test mode
-    if ($TestMode) {
-        $testSource = if ($TestMailbox) { $TestMailbox } else { $SourceMailboxes[0] }
-        Write-Log "Running in TEST MODE - Sending test email only" -Level Warning
-        
-        if (Send-TestEmail -TestMailbox $testSource -TargetMailbox $TargetMailbox) {
-            Write-Log "Test completed successfully" -Level Success
-        }
-        else {
-            Write-Log "Test failed" -Level Error
-        }
-        
-        return
-    }
-    
-    # Process each source mailbox
-    foreach ($sourceMailbox in $SourceMailboxes) {
-        Write-Log "`nProcessing mailbox: $sourceMailbox" -Level Info
-        
-        try {
-            # Get messages
-            $messages = Get-MailboxMessages `
-                -Mailbox $sourceMailbox `
-                -Folder $FolderName `
-                -StartDate $StartDate `
-                -EndDate $EndDate `
-                -SubjectFilter $SubjectFilter `
-                -HasAttachments:$AttachmentsOnly `
-                -Top $BatchSize
-            
-            if ($messages.Count -eq 0) {
-                Write-Log "No messages found in $sourceMailbox/$FolderName" -Level Warning
-                continue
-            }
-            
-            Write-Log "Processing $($messages.Count) messages from $sourceMailbox" -Level Info
-            
-            foreach ($message in $messages) {
-                # Check if already processed
-                if (Test-AlreadyProcessed -Message $message) {
-                    Write-Log "Skipping (already processed): $($message.subject)" -Level Info
-                    $skippedCount++
-                    continue
-                }
-                
-                # Check max messages limit
-                if ($MaxMessages -and $processedCount -ge $MaxMessages) {
-                    Write-Log "Reached maximum message limit ($MaxMessages)" -Level Warning
-                    break
-                }
-                
-                # Display what we're doing
-                $action = if ($WhatIf) { "[WHATIF]" } else { "[SENDING]" }
-                Write-Log "$action $($message.subject) (from: $($message.from.emailAddress.address))" -Level Info
-                
-                if (!$WhatIf) {
-                    try {
-                        # Send based on mode
-                        $sentId = if ($ReplayMode -eq "Transparent") {
-                            Send-TransparentReplay `
-                                -SourceMailbox $sourceMailbox `
-                                -MessageId $message.id `
-                                -TargetMailbox $TargetMailbox `
-                                -BccAddresses $BccAlways
-                        }
-                        else {
-                            Send-WrapperReplay `
-                                -SourceMailbox $sourceMailbox `
-                                -Message $message `
-                                -TargetMailbox $TargetMailbox `
-                                -BccAddresses $BccAlways
-                        }
-                        
-                        $processedCount++
-                        
-                        # Log success
-                        if ($LogSuccessful) {
-                            $logEntry = @{
-                                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                                SourceMailbox = $sourceMailbox
-                                MessageId = $message.id
-                                Subject = $message.subject
-                                From = $message.from.emailAddress.address
-                                ReceivedDate = $message.receivedDateTime
-                                TargetMailbox = $TargetMailbox
-                                ReplayMode = $ReplayMode
-                                SentId = $sentId
-                            }
-                            
-                            $logEntry | ConvertTo-Json -Compress | Add-Content -Path $logFile
-                        }
-                        
-                        Write-Log "Successfully sent: $($message.subject)" -Level Success
-                        
-                        # Throttle
-                        if ($ThrottleMs -gt 0) {
-                            Start-Sleep -Milliseconds $ThrottleMs
-                        }
-                    }
-                    catch {
-                        $errorCount++
-                        Write-Log "Failed to send: $($message.subject) - Error: $_" -Level Error
-                        
-                        # Log error
-                        if ($LogPath) {
-                            $errorEntry = @{
-                                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                                SourceMailbox = $sourceMailbox
-                                MessageId = $message.id
-                                Subject = $message.subject
-                                Error = $_.ToString()
-                            }
-                            
-                            $errorEntry | ConvertTo-Json -Compress | 
-                                Add-Content -Path ($logFile -replace '\.log$', '_errors.log')
-                        }
+        # Try to extract Graph error body, if available
+        if ($err.Exception -and $err.Exception.Response) {
+            try {
+                $resp = $err.Exception.Response
+                $stream = $resp.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $bodyText = $reader.ReadToEnd()
+                    if ($bodyText) {
+                        $msg += " | Response: $bodyText"
                     }
                 }
-                else {
-                    $processedCount++
-                }
+            } catch { }
+        }
+
+        Write-Log $msg -Level Error
+
+        if ($LogPath) {
+            $errorEntry = @{
+                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                SourceMailbox = $sourceMailbox
+                MessageId     = $message.id
+                Subject       = $message.subject
+                Error         = $err.ToString()
             }
+            $errorEntry | ConvertTo-Json -Compress |
+                Add-Content -Path ($logFile -replace '\.log$', '_errors.log')
         }
-        catch {
-            Write-Log "Error processing mailbox $sourceMailbox : $_" -Level Error
-        }
     }
-    
-    # Final summary
-    Write-Log "`n========================================" -Level Info
-    Write-Log "Processing Complete" -Level Success
-    Write-Log "========================================" -Level Info
-    Write-Log "Processed: $processedCount messages" -Level Info
-    Write-Log "Skipped: $skippedCount messages" -Level Info
-    Write-Log "Errors: $errorCount messages" -Level Info
-    
-    if ($LogPath -and $LogSuccessful) {
-        Write-Log "Log file: $logFile" -Level Info
-    }
-}
-catch {
-    Write-Log "Fatal error: $_" -Level Error
-    throw
-}
-finally {
-    # Cleanup
-    if ($LogPath) {
-        $footer = @"
-========================================
-Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-Total Processed: $processedCount
-Total Errors: $errorCount
-Total Skipped: $skippedCount
-========================================
-"@
-        Add-Content -Path $logFile -Value $footer -ErrorAction SilentlyContinue
-    }
-}
+}   #  
