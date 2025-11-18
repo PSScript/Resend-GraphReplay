@@ -74,6 +74,27 @@ param(
 # Configuration File Management
 # ================================
 
+$LogRoot = "c:\data\logs"   # Or wherever you want
+if (!(Test-Path $LogRoot)) { New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null }
+
+function Get-LogFilePath($mailbox) {
+    $safe = $mailbox -replace '[^\w\-\.@]', '_'
+    return Join-Path $LogRoot "$safe.csv"
+}
+
+$DedupFolder = Join-Path $LogRoot "dedup"
+if (!(Test-Path $DedupFolder)) { New-Item -ItemType Directory -Path $DedupFolder -Force | Out-Null }
+
+function Already-Sent($messageId, $recipient) {
+    $marker = Join-Path $DedupFolder ("$($messageId)_$($recipient -replace '[^\w\-\.@]', '_').txt")
+    return Test-Path $marker
+}
+
+function Mark-Sent($messageId, $recipient) {
+    $marker = Join-Path $DedupFolder ("$($messageId)_$($recipient -replace '[^\w\-\.@]', '_').txt")
+    Set-Content -Path $marker -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -NoNewline
+}
+
 function Save-ReplayConfig {
     param(
         [string]$Path,
@@ -701,6 +722,33 @@ function Send-WrapperReplay {
         if ($bodyType -eq "HTML") { $originalBody }
         else { [System.Web.HttpUtility]::HtmlEncode($originalBody) }
 
+        $htmlBody = @"
+<table border='0' cellpadding='8' bgcolor='#fef3e2' style='border-left:5px solid #f39c12;'>
+  <tr>
+    <td>
+      <b style='color:#d68910;'>&#9888; Diese E-Mail wurde erneut zugestellt</b><br/>
+      <div style='margin-top:8px;background:#fff;'>
+        <b>Ursprünglicher Absender:</b> $originalFrom<br/>
+        <b>Ursprüngliche Empfänger:</b> $originalTo<br/>
+        <b>Empfangen am:</b> $receivedTime<br/>
+        <b>Betreff:</b> $([System.Web.HttpUtility]::HtmlEncode($Message.subject))
+      </div>
+      <div style='margin-top:8px;font-size:12px;'>
+        <i>Die ursprüngliche E-Mail ist als <b>.eml-Datei</b> im Anhang enthalten.</i><br/>
+        <span>Bitte antworten Sie bei Bedarf dem ursprünglichen Absender.</span>
+      </div>
+    </td>
+  </tr>
+</table>
+
+<hr>
+<b>Ursprüngliche Nachricht:</b><br/>
+$renderedOriginalBody
+<hr>
+<i>Alle ursprünglichen Anhänge sind zusammen mit der .eml-Datei unten angefügt.</i>
+"@
+
+<#
     $htmlBody = @"
 <table border='0' cellpadding='8' bgcolor='#fef3e2' style='border-left:5px solid #f39c12;'>
   <tr>
@@ -727,6 +775,8 @@ $renderedOriginalBody
 <i>All original attachments are attached below along with the .eml file.</i>
 "@
 
+#>
+
     $attachmentsList = @()
 
     foreach ($att in $attachments) {
@@ -748,7 +798,7 @@ $renderedOriginalBody
     }
 
     $newMessage = @{
-        subject = "[REPLAYED] $($Message.subject)"
+        subject = "[Weiterleitung] $($Message.subject)"
         body = @{
             contentType = "HTML"
             content = $htmlBody
