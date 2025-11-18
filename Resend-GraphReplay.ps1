@@ -948,126 +948,138 @@ try {
             Write-Log "Processing $($messages.Count) messages from $sourceMailbox" -Level Info
             
             foreach ($message in $messages) {
-                if (Test-AlreadyProcessed -Message $message) {
-                    Write-Log "Skipping (already processed): $($message.subject)" -Level Info
-                    $skippedCount++
-                    continue
-                }
-                
-                if ($MaxMessages -and $processedCount -ge $MaxMessages) {
-                    Write-Log "Reached maximum message limit ($MaxMessages)" -Level Warning
-                    break
-                }
-                
-                $action = if ($WhatIf) { "[WHATIF]" } else { "[SENDING]" }
-                Write-Log "$action $($message.subject) (from: $($message.from.emailAddress.address))" -Level Info
-                
-                if (-not $WhatIf) {
-                    try {
-                        $sentId = if ($ReplayMode -eq "Transparent") {
-                            if ($TrueTransparentReplay) {
-                                Send-TrueTransparentReplay `
-                                    -SourceMailbox $sourceMailbox `
-                                    -MessageId $message.id `
-                                    -TargetMailbox $TargetMailbox `
-                                    -ReplayHeader $ReplayHeader
-                            }
-                            else {
-                                Send-TransparentReplay `
-                                    -SourceMailbox $sourceMailbox `
-                                    -MessageId $message.id `
-                                    -TargetMailbox $TargetMailbox `
-                                    -BccAddresses $BccAlways
-                            }
-                        }
-                        else {
-                            Send-WrapperReplay `
-                                -SourceMailbox $sourceMailbox `
-                                -Message $message `
-                                -TargetMailbox $TargetMailbox `
-                                -BccAddresses $BccAlways
-                        }
 
-                        $processedCount++
-                        
-                        if ($LogSuccessful) {
-                            $logEntry = @{
-                                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                                SourceMailbox = $sourceMailbox
-                                MessageId     = $message.id
-                                Subject       = $message.subject
-                                From          = $message.from.emailAddress.address
-                                ReceivedDate  = $message.receivedDateTime
-                                TargetMailbox = $TargetMailbox
-                                ReplayMode    = $ReplayMode
-                                SentId        = $sentId
-                            }
-                            
-                            $logEntry | ConvertTo-Json -Compress | Add-Content -Path $logFile
-                        }
-                        
-                        Write-Log "Successfully sent: $($message.subject)" -Level Success
-                        
-                        if ($ThrottleMs -gt 0) {
-                            Start-Sleep -Milliseconds $ThrottleMs
-                        }
-                    }
-                    catch {
-                        $errorCount++
-                        Write-Log "Failed to send: $($message.subject) - Error: $_" -Level Error
-                        
-                        if ($LogPath) {
-                            $logBase = [IO.Path]::GetFileNameWithoutExtension($logFile)
-                            $logDir  = [IO.Path]::GetDirectoryName($logFile)
-                            $errorLogFile = Join-Path $logDir ($logBase + "_errors.log")
+    # 1) Skip messages tagged with ProcessedHeader (Graph header in original message)
+    if (Test-AlreadyProcessed -Message $message) {
+        Write-Log "Skipping (already processed): $($message.subject)" -Level Info
+        $skippedCount++
+        continue
+    }
 
-                            $errorEntry = @{
-                                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                                SourceMailbox = $sourceMailbox
-                                MessageId     = $message.id
-                                Subject       = $message.subject
-                                Error         = $_.ToString()
-                            }
-                            
-                            $errorEntry | ConvertTo-Json -Compress | Add-Content -Path $errorLogFile
-                        }
-                    }
+    # 2) DEDUP: skip if MessageId + TargetMailbox already sent in previous runs
+    if (Already-Sent $message.id $TargetMailbox) {
+        Write-Log "Skipping (already resent): $($message.subject) to $TargetMailbox [MessageId: $($message.id)]" -Level Warning
+        $skippedCount++
+        continue
+    }
+
+    # 3) Max message limit
+    if ($MaxMessages -and $processedCount -ge $MaxMessages) {
+        Write-Log "Reached maximum message limit ($MaxMessages)" -Level Warning
+        break
+    }
+
+    $action = if ($WhatIf) { "[WHATIF]" } else { "[SENDING]" }
+    Write-Log "$action $($message.subject) (from: $($message.from.emailAddress.address))" -Level Info
+
+    if (-not $WhatIf) {
+        try {
+
+            # Fetch attachments if ReplayMode = Wrapper
+            $attachments = @()
+            if ($ReplayMode -eq "Wrapper") {
+                $uri = "https://graph.microsoft.com/v1.0/users/$sourceMailbox/messages/$($message.id)?`$expand=attachments"
+                $fullMessage = Invoke-GraphRequest -Uri $uri
+                $attachments = $fullMessage.attachments
+            }
+
+            # SEND based on mode
+            $sentId = if ($ReplayMode -eq "Transparent") {
+                if ($TrueTransparentReplay) {
+                    Send-TrueTransparentReplay `
+                        -SourceMailbox $sourceMailbox `
+                        -MessageId $message.id `
+                        -TargetMailbox $TargetMailbox `
+                        -ReplayHeader $ReplayHeader
                 }
                 else {
-                    $processedCount++
+                    Send-TransparentReplay `
+                        -SourceMailbox $sourceMailbox `
+                        -MessageId $message.id `
+                        -TargetMailbox $TargetMailbox `
+                        -BccAddresses $BccAlways
                 }
             }
+            else {
+                Send-WrapperReplay `
+                    -SourceMailbox $sourceMailbox `
+                    -Message $message `
+                    -TargetMailbox $TargetMailbox `
+                    -BccAddresses $BccAlways
+            }
+
+            $processedCount++
+
+            # 4) Per-mailbox CSV logging
+            $csvPath = Get-LogFilePath $sourceMailbox
+            $csvLine = [PSCustomObject]@{
+                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                MessageId     = $message.id
+                Subject       = $message.subject
+                From          = $message.from.emailAddress.address
+                To            = $TargetMailbox
+                ReplayMode    = $ReplayMode
+                Attachments   = ($attachments | Where-Object { $_.name } | ForEach-Object { $_.name }) -join ';'
+                Status        = "SENT"
+            }
+            $writeHeader = -not (Test-Path $csvPath)
+            $csvLine | Export-Csv -Path $csvPath -Append -NoTypeInformation -Encoding UTF8
+            if ($writeHeader) {
+                (Get-Content $csvPath) | Set-Content $csvPath
+            }
+
+            # 5) Dedup marker creation
+            Mark-Sent $message.id $TargetMailbox
+
+            Write-Log "Successfully sent: $($message.subject)" -Level Success
+
+            if ($ThrottleMs -gt 0) {
+                Start-Sleep -Milliseconds $ThrottleMs
+            }
+
+        }
+        catch {
+            $errorCount++
+            Write-Log "Failed to send: $($message.subject) - Error: $_" -Level Error
+
+            # 6) Mailbox-specific error CSV
+            $errorCsv = Join-Path $LogRoot "$($sourceMailbox -replace '[^\w\-\.@]', '_')_errors.csv"
+            $attNames = ($attachments | Where-Object { $_.name } | ForEach-Object { $_.name }) -join ';'
+
+            $errRecord = [PSCustomObject]@{
+                Timestamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                MessageId   = $message.id
+                Subject     = $message.subject
+                From        = $message.from.emailAddress.address
+                To          = $TargetMailbox
+                Attachments = $attNames
+                Error       = $_.ToString()
+            }
+
+            $writeHeader = -not (Test-Path $errorCsv)
+            $errRecord | Export-Csv -Path $errorCsv -Append -NoTypeInformation -Encoding UTF8
+            if ($writeHeader) {
+                (Get-Content $errorCsv) | Set-Content $errorCsv
+            }
+        }
+    }
+    else {
+        $processedCount++
+    }
+}
         }
         catch {
             Write-Log "Error processing mailbox $sourceMailbox : $_" -Level Error
         }
     }
     
-    Write-Log "`n========================================" -Level Info
-    Write-Log "Processing Complete" -Level Success
-    Write-Log "========================================" -Level Info
-    Write-Log "Processed: $processedCount messages" -Level Info
-    Write-Log "Skipped: $skippedCount messages" -Level Info
-    Write-Log "Errors: $errorCount messages" -Level Info
-    
-    if ($LogPath -and $LogSuccessful) {
-        Write-Log "Log file: $logFile" -Level Info
-    }
+    Write-Log "`n=== Summary ===" -Level Info
+    Write-Log "Total Processed: $processedCount" -Level Info
+    Write-Log "Total Skipped:   $skippedCount" -Level Info
+    Write-Log "Total Errors:    $errorCount" -Level Info
+    Write-Log "Script completed." -Level Info
 }
 catch {
     Write-Log "Fatal error: $_" -Level Error
     throw
-}
-finally {
-    if ($LogPath) {
-        $footer = @"
-========================================
-Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-Total Processed: $processedCount
-Total Errors: $errorCount
-Total Skipped: $skippedCount
-========================================
-"@
-        Add-Content -Path $logFile -Value $footer -ErrorAction SilentlyContinue
-    }
-}
+}   
