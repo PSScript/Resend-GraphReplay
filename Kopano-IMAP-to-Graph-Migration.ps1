@@ -217,6 +217,69 @@ function Initialize-MailKit {
 # Alternative: Pure .NET IMAP Implementation
 # ================================
 
+# IMAP UTF-7 Decoding for folder names (e.g., &APw- -> ü)
+function ConvertFrom-ImapUtf7 {
+    param([string]$EncodedString)
+
+    if ([string]::IsNullOrEmpty($EncodedString)) {
+        return $EncodedString
+    }
+
+    # IMAP uses modified UTF-7 where & is the shift character
+    $result = New-Object System.Text.StringBuilder
+    $i = 0
+
+    while ($i -lt $EncodedString.Length) {
+        if ($EncodedString[$i] -eq '&') {
+            # Check for &- which is literal &
+            if ($i + 1 -lt $EncodedString.Length -and $EncodedString[$i + 1] -eq '-') {
+                $result.Append('&') | Out-Null
+                $i += 2
+                continue
+            }
+
+            # Find end of encoded sequence
+            $endIdx = $EncodedString.IndexOf('-', $i + 1)
+            if ($endIdx -eq -1) {
+                $result.Append($EncodedString[$i]) | Out-Null
+                $i++
+                continue
+            }
+
+            # Extract Base64 encoded part
+            $encoded = $EncodedString.Substring($i + 1, $endIdx - $i - 1)
+
+            if ($encoded.Length -gt 0) {
+                try {
+                    # IMAP UTF-7 uses , instead of / in Base64
+                    $base64 = $encoded.Replace(',', '/')
+
+                    # Pad if necessary
+                    $padding = (4 - ($base64.Length % 4)) % 4
+                    $base64 = $base64 + ('=' * $padding)
+
+                    # Decode as UTF-16BE
+                    $bytes = [Convert]::FromBase64String($base64)
+                    $decoded = [System.Text.Encoding]::BigEndianUnicode.GetString($bytes)
+                    $result.Append($decoded) | Out-Null
+                }
+                catch {
+                    # If decoding fails, keep original
+                    $result.Append($EncodedString.Substring($i, $endIdx - $i + 1)) | Out-Null
+                }
+            }
+
+            $i = $endIdx + 1
+        }
+        else {
+            $result.Append($EncodedString[$i]) | Out-Null
+            $i++
+        }
+    }
+
+    return $result.ToString()
+}
+
 class SimpleImapClient {
     [System.Net.Sockets.TcpClient]$TcpClient
     [System.IO.StreamReader]$Reader
@@ -669,14 +732,17 @@ function Get-OrCreateMailFolder {
         [hashtable]$FolderCache = @{}
     )
 
+    # Decode IMAP UTF-7 encoding in folder path (e.g., &APw- -> ü)
+    $decodedPath = ConvertFrom-ImapUtf7 -EncodedString $FolderPath
+
     # Check cache first
-    $cacheKey = "$TargetMailbox|$FolderPath"
+    $cacheKey = "$TargetMailbox|$decodedPath"
     if ($FolderCache.ContainsKey($cacheKey)) {
         return $FolderCache[$cacheKey]
     }
 
     # Normalize folder path
-    $normalizedPath = $FolderPath -replace '/', '\' -replace '\\+', '\'
+    $normalizedPath = $decodedPath -replace '/', '\' -replace '\\+', '\'
     $parts = $normalizedPath.Split('\') | Where-Object { $_ -ne '' }
 
     # Map common folder names
@@ -793,8 +859,11 @@ function Import-MessageToGraph {
     }
 
     try {
+        # Convert bytes to string, handling encoding properly
+        $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
+
         # First, create message from MIME
-        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $MimeContent
+        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeString -ContentType "text/plain; charset=utf-8"
         $createdMessage = $response.Content | ConvertFrom-Json
 
         # Update the message to set read status and potentially adjust dates
@@ -811,6 +880,20 @@ function Import-MessageToGraph {
         return $createdMessage.id
     }
     catch {
+        # Try to get more error details
+        $errorDetails = ""
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errorDetails = $reader.ReadToEnd()
+                $reader.Close()
+            }
+            catch { }
+        }
+
+        if ($errorDetails) {
+            throw "Failed to import message: $_ - Details: $errorDetails"
+        }
         throw "Failed to import message: $_"
     }
 }
