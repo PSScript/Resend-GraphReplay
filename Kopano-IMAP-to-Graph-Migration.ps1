@@ -872,20 +872,8 @@ function Import-MessageToGraph {
         if ($response.StatusCode -in @(200, 201)) {
             $createdMessage = $response.Content | ConvertFrom-Json
 
-            # Update message properties: read status and mark as NOT draft
-            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-            $updateBody = @{
-                isRead = $IsRead
-                # Use singleValueExtendedProperties to set PR_MESSAGE_FLAGS
-                # Flag 0x01 = MSGFLAG_READ, clearing MSGFLAG_UNSENT (0x08) makes it not a draft
-                singleValueExtendedProperties = @(
-                    @{
-                        id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
-                        value = "1"           # MSGFLAG_READ (removes draft status)
-                    }
-                )
-            }
-            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            # Update message with original date and mark as NOT draft
+            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $createdMessage.id -ReceivedDate $ReceivedDate -IsRead $IsRead
 
             return $createdMessage.id
         }
@@ -912,18 +900,8 @@ function Import-MessageToGraph {
             $responseContent = $response.Content.ReadAsStringAsync().Result
             $createdMessage = $responseContent | ConvertFrom-Json
 
-            # Update message properties: read status and mark as NOT draft
-            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-            $updateBody = @{
-                isRead = $IsRead
-                singleValueExtendedProperties = @(
-                    @{
-                        id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
-                        value = "1"           # MSGFLAG_READ (removes draft status)
-                    }
-                )
-            }
-            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            # Update message with original date and mark as NOT draft
+            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $createdMessage.id -ReceivedDate $ReceivedDate -IsRead $IsRead
 
             $httpClient.Dispose()
             return $createdMessage.id
@@ -937,18 +915,68 @@ function Import-MessageToGraph {
 
     # Method 3: Fallback to wrapper with .eml attachment
     Write-Log "Using fallback method (wrapper with .eml attachment)" -Level Debug
-    return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
+    return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -ReceivedDate $ReceivedDate -IsRead $IsRead
+}
+
+function Set-MessageDateAndFlags {
+    <#
+    .SYNOPSIS
+    Set the original date and mark message as received (not draft) using MAPI extended properties
+    #>
+    param(
+        [string]$TargetMailbox,
+        [string]$MessageId,
+        [datetime]$ReceivedDate,
+        [bool]$IsRead = $true
+    )
+
+    $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$MessageId"
+
+    # Format date for MAPI property (ISO 8601)
+    $dateString = $ReceivedDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $updateBody = @{
+        isRead = $IsRead
+        # Use singleValueExtendedProperties to set MAPI properties
+        singleValueExtendedProperties = @(
+            @{
+                # PR_MESSAGE_FLAGS - Mark as received (not draft)
+                # MSGFLAG_READ (0x01) + MSGFLAG_UNMODIFIED (0x02) = 3
+                # Without MSGFLAG_UNSENT (0x08) = not a draft
+                id = "Integer 0x0E07"
+                value = "1"
+            },
+            @{
+                # PR_MESSAGE_DELIVERY_TIME - When message was delivered/received
+                id = "SystemTime 0x0E06"
+                value = $dateString
+            },
+            @{
+                # PR_CLIENT_SUBMIT_TIME - When message was sent
+                id = "SystemTime 0x0039"
+                value = $dateString
+            }
+        )
+    }
+
+    try {
+        Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+    }
+    catch {
+        Write-Log "Failed to set message date/flags: $_" -Level Warning
+    }
 }
 
 function Import-MessageToGraphBase64 {
     <#
     .SYNOPSIS
-    Fallback method using Base64 encoded MIME content
+    Fallback method using Base64 encoded MIME content with .eml attachment
     #>
     param(
         [string]$TargetMailbox,
         [string]$FolderId,
         [byte[]]$MimeContent,
+        [datetime]$ReceivedDate,
         [bool]$IsRead = $true
     )
 
@@ -960,11 +988,10 @@ function Import-MessageToGraphBase64 {
     # Parse MIME headers to extract basic info for fallback message creation
     $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
 
-    # Extract headers
+    # Extract headers for wrapper message
     $subject = "Imported Message"
     $from = ""
     $to = @()
-    $date = Get-Date
 
     if ($mimeString -match '(?m)^Subject:\s*(.+?)(?:\r?\n(?!\s)|$)') {
         $subject = $matches[1].Trim()
@@ -1007,12 +1034,8 @@ function Import-MessageToGraphBase64 {
         $to = $toAddresses | ForEach-Object { $_.Value }
     }
 
-    if ($mimeString -match '(?m)^Date:\s*(.+?)(?:\r?\n(?!\s)|$)') {
-        try {
-            $date = [datetime]::Parse($matches[1].Trim())
-        }
-        catch { }
-    }
+    # Use the ReceivedDate parameter (from IMAP INTERNALDATE) - more reliable than parsing MIME
+    $date = if ($ReceivedDate -and $ReceivedDate -ne [datetime]::MinValue) { $ReceivedDate } else { Get-Date }
 
     # Create message with .eml attachment (preserves original exactly)
     $emlBase64 = [Convert]::ToBase64String($MimeContent)
@@ -1062,17 +1085,8 @@ function Import-MessageToGraphBase64 {
     try {
         $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $message
 
-        # Mark message as NOT draft using extended properties
-        $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($created.id)"
-        $updateBody = @{
-            singleValueExtendedProperties = @(
-                @{
-                    id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
-                    value = "1"           # MSGFLAG_READ (removes draft status)
-                }
-            )
-        }
-        Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+        # Set original date and mark as NOT draft using MAPI extended properties
+        Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $created.id -ReceivedDate $ReceivedDate -IsRead $IsRead
 
         return $created.id
     }
