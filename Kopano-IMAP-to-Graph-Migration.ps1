@@ -853,34 +853,174 @@ function Import-MessageToGraph {
 
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
 
-    $headers = @{
-        "Authorization" = "Bearer $(Get-GraphToken)"
-        "Content-Type"  = "text/plain"
+    $token = Get-GraphToken
+
+    try {
+        # Try raw MIME upload first (works for most messages)
+        # Use HttpClient for proper binary handling
+        Add-Type -AssemblyName System.Net.Http
+
+        $httpClient = New-Object System.Net.Http.HttpClient
+        $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
+
+        # Create content with proper MIME type
+        $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
+        $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
+
+        $response = $httpClient.PostAsync($uri, $content).Result
+
+        if ($response.IsSuccessStatusCode) {
+            $responseContent = $response.Content.ReadAsStringAsync().Result
+            $createdMessage = $responseContent | ConvertFrom-Json
+
+            # Update the message to set read status
+            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
+            $updateBody = @{ isRead = $IsRead }
+            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+
+            $httpClient.Dispose()
+            return $createdMessage.id
+        }
+        else {
+            $errorContent = $response.Content.ReadAsStringAsync().Result
+            $httpClient.Dispose()
+
+            # If raw MIME fails, try Base64 encoded upload
+            Write-Log "Raw MIME failed, trying Base64 method..." -Level Debug
+
+            return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
+        }
+    }
+    catch {
+        # Fallback to Base64 method
+        Write-Log "MIME import exception, trying Base64 method: $_" -Level Debug
+
+        return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
+    }
+}
+
+function Import-MessageToGraphBase64 {
+    <#
+    .SYNOPSIS
+    Fallback method using Base64 encoded MIME content
+    #>
+    param(
+        [string]$TargetMailbox,
+        [string]$FolderId,
+        [byte[]]$MimeContent,
+        [bool]$IsRead = $true
+    )
+
+    # Use createUploadSession for larger messages or problematic MIME
+    # Or convert to draft message approach
+
+    $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
+
+    # Parse MIME headers to extract basic info for fallback message creation
+    $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
+
+    # Extract headers
+    $subject = "Imported Message"
+    $from = ""
+    $to = @()
+    $date = Get-Date
+
+    if ($mimeString -match '(?m)^Subject:\s*(.+?)(?:\r?\n(?!\s)|$)') {
+        $subject = $matches[1].Trim()
+        # Decode MIME encoded words if present
+        if ($subject -match '=\?') {
+            try {
+                # Basic MIME word decoding
+                $subject = $subject -replace '=\?([^?]+)\?([BQ])\?([^?]+)\?=', {
+                    param($m)
+                    $charset = $m.Groups[1].Value
+                    $encoding = $m.Groups[2].Value
+                    $data = $m.Groups[3].Value
+                    if ($encoding -eq 'B') {
+                        [System.Text.Encoding]::GetEncoding($charset).GetString([Convert]::FromBase64String($data))
+                    }
+                    else {
+                        # Q encoding
+                        $decoded = $data -replace '_', ' ' -replace '=([0-9A-F]{2})', { [char][convert]::ToInt32($_.Groups[1].Value, 16) }
+                        $decoded
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    if ($mimeString -match '(?m)^From:\s*(.+?)(?:\r?\n(?!\s)|$)') {
+        $fromHeader = $matches[1].Trim()
+        if ($fromHeader -match '<([^>]+)>') {
+            $from = $matches[1]
+        }
+        elseif ($fromHeader -match '[\w\.-]+@[\w\.-]+') {
+            $from = $matches[0]
+        }
+    }
+
+    if ($mimeString -match '(?m)^To:\s*(.+?)(?:\r?\n(?!\s)|$)') {
+        $toHeader = $matches[1].Trim()
+        $toAddresses = [regex]::Matches($toHeader, '[\w\.-]+@[\w\.-]+')
+        $to = $toAddresses | ForEach-Object { $_.Value }
+    }
+
+    if ($mimeString -match '(?m)^Date:\s*(.+?)(?:\r?\n(?!\s)|$)') {
+        try {
+            $date = [datetime]::Parse($matches[1].Trim())
+        }
+        catch { }
+    }
+
+    # Create message with .eml attachment (preserves original exactly)
+    $emlBase64 = [Convert]::ToBase64String($MimeContent)
+
+    $message = @{
+        subject = "[Migrated] $subject"
+        body    = @{
+            contentType = "HTML"
+            content     = @"
+<div style='padding:10px;background:#fff3cd;border-left:4px solid #ffc107;margin-bottom:15px;'>
+<strong>Migrierte E-Mail</strong><br/>
+<small>Original-Datum: $($date.ToString('dd.MM.yyyy HH:mm'))</small><br/>
+<small>Die Original-E-Mail ist als .eml-Datei angehängt.</small>
+</div>
+"@
+        }
+        toRecipients = @()
+        isRead       = $IsRead
+        internetMessageHeaders = @(
+            @{ name = "X-Migrated-From"; value = "Kopano-IMAP" }
+            @{ name = "X-Original-Date"; value = $date.ToString("r") }
+        )
+        attachments  = @(
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name          = "original_email.eml"
+                contentType   = "message/rfc822"
+                contentBytes  = $emlBase64
+            }
+        )
+    }
+
+    if ($from) {
+        $message.from = @{
+            emailAddress = @{ address = $from }
+        }
+    }
+
+    if ($to.Count -gt 0) {
+        $message.toRecipients = @($to | ForEach-Object {
+            @{ emailAddress = @{ address = $_ } }
+        })
     }
 
     try {
-        # Convert bytes to string, handling encoding properly
-        $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
-
-        # First, create message from MIME
-        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeString -ContentType "text/plain; charset=utf-8"
-        $createdMessage = $response.Content | ConvertFrom-Json
-
-        # Update the message to set read status and potentially adjust dates
-        $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-        $updateBody = @{
-            isRead = $IsRead
-        }
-
-        # Note: receivedDateTime cannot be modified after creation via MIME import,
-        # but the MIME Date header should be preserved
-
-        Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
-
-        return $createdMessage.id
+        $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $message
+        return $created.id
     }
     catch {
-        # Try to get more error details
         $errorDetails = ""
         if ($_.Exception.Response) {
             try {
@@ -892,9 +1032,9 @@ function Import-MessageToGraph {
         }
 
         if ($errorDetails) {
-            throw "Failed to import message: $_ - Details: $errorDetails"
+            throw "Failed to import message (Base64 fallback): $_ - Details: $errorDetails"
         }
-        throw "Failed to import message: $_"
+        throw "Failed to import message (Base64 fallback): $_"
     }
 }
 
