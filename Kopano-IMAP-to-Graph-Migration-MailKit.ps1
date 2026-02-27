@@ -537,10 +537,26 @@ function Migrate-UserMailbox {
 
     $userStats = @{ TotalMessages = 0; Migrated = 0; Skipped = 0; Failed = 0; Folders = 0 }
     $client = $null
+    $secureSocket = $null
+
+    # Helper function to connect/reconnect
+    function Connect-ImapClient {
+        param($client)
+        
+        if ($client.IsConnected) { return }
+        
+        Write-Log "Connecting to $ImapServer`:$ImapPort..." -Level Info -User $sourceEmail
+        $client.Connect($ImapServer, $ImapPort, $secureSocket)
+        $client.Authenticate($imapUsername, $imapPassword)
+        Write-Log "Connected" -Level Debug -User $sourceEmail
+    }
 
     try {
         # Create MailKit IMAP client
         $client = New-Object MailKit.Net.Imap.ImapClient
+        
+        # Set timeouts (30 seconds instead of default 2 minutes)
+        $client.Timeout = 30000
 
         # Certificate validation callback for self-signed certs
         if ($ImapSkipCertValidation) {
@@ -558,12 +574,7 @@ function Migrate-UserMailbox {
             [MailKit.Security.SecureSocketOptions]::StartTlsWhenAvailable
         }
 
-        Write-Log "Connecting to $ImapServer`:$ImapPort..." -Level Info -User $sourceEmail
-        $client.Connect($ImapServer, $ImapPort, $secureSocket)
-
-        # Authenticate
-        Write-Log "Authenticating..." -Level Debug -User $sourceEmail
-        $client.Authenticate($imapUsername, $imapPassword)
+        Connect-ImapClient $client
 
         Write-Log "Connected and authenticated via MailKit" -Level Success -User $sourceEmail
 
@@ -571,10 +582,24 @@ function Migrate-UserMailbox {
         $personalNamespace = $client.PersonalNamespaces[0]
         $folders = $client.GetFolders($personalNamespace)
 
-        Write-Log "Found $($folders.Count) folders" -Level Info -User $sourceEmail
+        # Filter out problematic folders BEFORE processing
+        $folderNames = @($folders | ForEach-Object { $_.FullName })
+        Write-Log "Found $($folders.Count) folders: $($folderNames -join ', ')" -Level Info -User $sourceEmail
 
         foreach ($folder in $folders) {
             $folderName = $folder.FullName
+
+            # Skip GUID folders (Kopano internal folders like {06967759-274D-40B2-A3EB-D7F9E73727D7})
+            if ($folderName -match '^\{[0-9A-Fa-f-]{36}\}$') {
+                Write-Log "Skipping GUID folder: $folderName" -Level Debug -User $sourceEmail
+                continue
+            }
+
+            # Skip Conversation History and other problematic folders
+            if ($folderName -in @('Conversation History', 'Sync Issues', 'Conflicts', 'Local Failures', 'Server Failures')) {
+                Write-Log "Skipping system folder: $folderName" -Level Debug -User $sourceEmail
+                continue
+            }
 
             # Check exclusions
             if (Test-FolderExcluded -FolderName $folderName) {
@@ -591,12 +616,33 @@ function Migrate-UserMailbox {
                 }
             }
 
+            # Reconnect if connection was lost
+            if (!$client.IsConnected) {
+                Write-Log "Connection lost, reconnecting..." -Level Warning -User $sourceEmail
+                try {
+                    Connect-ImapClient $client
+                    # Re-fetch folder reference after reconnect
+                    $personalNamespace = $client.PersonalNamespaces[0]
+                    $folder = $client.GetFolder($folderName)
+                }
+                catch {
+                    Write-Log "Reconnect failed: $_" -Level Error -User $sourceEmail
+                    throw
+                }
+            }
+
             # Open folder read-only
             try {
                 $folder.Open([MailKit.FolderAccess]::ReadOnly)
             }
             catch {
-                Write-Log "Cannot open folder: $folderName - $_" -Level Warning -User $sourceEmail
+                $errMsg = $_.Exception.Message
+                Write-Log "Cannot open folder: $folderName - $errMsg" -Level Warning -User $sourceEmail
+                
+                # If connection lost, reconnect and continue with next folder
+                if ($errMsg -match 'not connected|timeout|Verbindungsversuch') {
+                    Write-Log "Connection issue, will reconnect for next folder" -Level Warning -User $sourceEmail
+                }
                 continue
             }
 
