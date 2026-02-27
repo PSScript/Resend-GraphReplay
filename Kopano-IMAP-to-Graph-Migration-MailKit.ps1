@@ -379,44 +379,11 @@ function Import-MessageToGraph {
     )
 
     $token = Get-GraphToken
+    
+    # Method 1: Direct MIME import via /messages endpoint
+    # Graph API accepts raw MIME with Content-Type: text/plain
     $createUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
 
-    # Method 1: Direct MIME import
-    try {
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Content-Type"  = "text/plain"
-        }
-
-        $mimeString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($MimeContent)
-        $response = Invoke-WebRequest -Method POST -Uri $createUri -Headers $headers -Body $mimeString -UseBasicParsing
-
-        if ($response.StatusCode -in @(200, 201)) {
-            $createdMessage = $response.Content | ConvertFrom-Json
-            $messageId = $createdMessage.id
-
-            # Move to target folder
-            if ($FolderId) {
-                try {
-                    $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
-                    $movedMessage = Invoke-GraphRequest -Uri $moveUri -Method POST -Body @{ destinationId = $FolderId }
-                    $messageId = $movedMessage.id
-                }
-                catch {
-                    Write-Log "Failed to move message: $_" -Level Warning
-                }
-            }
-
-            # Set date and flags
-            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $messageId -ReceivedDate $ReceivedDate -IsRead $IsRead
-            return $messageId
-        }
-    }
-    catch {
-        Write-Log "MIME import failed: $($_.Exception.Message)" -Level Debug
-    }
-
-    # Method 2: Fallback with HttpClient
     try {
         Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
@@ -424,34 +391,102 @@ function Import-MessageToGraph {
         $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
         $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
 
+        # Send raw MIME bytes
         $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
         $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
 
         $response = $httpClient.PostAsync($createUri, $content).Result
+        $responseBody = $response.Content.ReadAsStringAsync().Result
 
         if ($response.IsSuccessStatusCode) {
-            $responseContent = $response.Content.ReadAsStringAsync().Result
-            $createdMessage = $responseContent | ConvertFrom-Json
+            $createdMessage = $responseBody | ConvertFrom-Json
             $messageId = $createdMessage.id
 
+            # Move to target folder if specified
             if ($FolderId) {
                 try {
                     $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
                     $movedMessage = Invoke-GraphRequest -Uri $moveUri -Method POST -Body @{ destinationId = $FolderId }
                     $messageId = $movedMessage.id
                 }
-                catch { }
+                catch {
+                    Write-Log "Move to folder failed (message still in Inbox): $_" -Level Warning
+                }
             }
 
+            # Set original date and read status
             Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $messageId -ReceivedDate $ReceivedDate -IsRead $IsRead
+            
             $httpClient.Dispose()
             return $messageId
+        }
+        else {
+            Write-Log "MIME import failed - Status: $($response.StatusCode)" -Level Warning
+            Write-Log "Response: $responseBody" -Level Debug
         }
 
         $httpClient.Dispose()
     }
     catch {
-        Write-Log "HttpClient import failed: $_" -Level Debug
+        Write-Log "MIME import exception: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Method 2: Create message with .eml attachment as fallback
+    # This preserves the original email exactly
+    Write-Log "Trying fallback: create wrapper message with .eml attachment..." -Level Debug
+    
+    try {
+        # Parse basic info from MIME for the wrapper
+        $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
+        
+        $subject = "(Migrated Email)"
+        if ($mimeString -match '(?mi)^Subject:\s*(.+?)(?:\r?\n(?!\s)|$)') {
+            $rawSubject = $matches[1].Trim()
+            # Decode MIME encoded words if present
+            if ($rawSubject -notmatch '=\?') {
+                $subject = $rawSubject
+            } else {
+                $subject = $rawSubject -replace '=\?[^?]+\?[BQ]\?[^?]+\?=', '(encoded)'
+            }
+            if ($subject.Length -gt 200) { $subject = $subject.Substring(0, 197) + "..." }
+        }
+
+        # Create wrapper message with original as .eml attachment
+        $emlBase64 = [Convert]::ToBase64String($MimeContent)
+        
+        $messageBody = @{
+            subject = "[Migrated] $subject"
+            body = @{
+                contentType = "HTML"
+                content = "<p><strong>Migrierte E-Mail</strong></p><p>Original-Datum: $($ReceivedDate.ToString('dd.MM.yyyy HH:mm'))</p><p>Die Original-E-Mail ist als .eml Datei angehängt.</p>"
+            }
+            isRead = $IsRead
+            attachments = @(
+                @{
+                    "@odata.type" = "#microsoft.graph.fileAttachment"
+                    name = "original.eml"
+                    contentType = "message/rfc822"
+                    contentBytes = $emlBase64
+                }
+            )
+        }
+
+        $uri = if ($FolderId) {
+            "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
+        } else {
+            "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
+        }
+
+        $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $messageBody
+        
+        # Try to set the date
+        Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $created.id -ReceivedDate $ReceivedDate -IsRead $IsRead
+        
+        Write-Log "Created wrapper message with .eml attachment" -Level Debug
+        return $created.id
+    }
+    catch {
+        Write-Log "Fallback method also failed: $_" -Level Error
     }
 
     throw "All import methods failed for message"
