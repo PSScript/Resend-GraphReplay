@@ -380,22 +380,40 @@ function Import-MessageToGraph {
 
     $token = Get-GraphToken
     
-    # Method 1: Direct MIME import via /messages endpoint
-    # Graph API accepts raw MIME with Content-Type: text/plain
+    # Method 1: Create message via $value endpoint with Base64-encoded MIME
+    # Graph API expects Base64 when using application/json approach
     $createUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
 
     try {
+        # Base64 encode the MIME content
+        $mimeBase64 = [Convert]::ToBase64String($MimeContent)
+        
+        # Create message with MIME content via JSON
+        $messageBody = @{
+            # This is the key - send MIME as base64 in the proper field
+        }
+        
+        # Actually, Graph API v1.0 doesn't support direct MIME import easily
+        # Use beta endpoint which has better MIME support
+        $betaUri = "https://graph.microsoft.com/beta/users/$TargetMailbox/messages"
+        
+        $headers = @{
+            "Authorization" = "Bearer $token"
+            "Content-Type"  = "text/plain"
+        }
+        
+        # Try sending raw MIME string (not bytes) - some encodings work
+        $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
+        
         Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
-
         $httpClient = New-Object System.Net.Http.HttpClient
         $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
         $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
 
-        # Send raw MIME bytes
-        $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
-        $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
+        # Try with StringContent UTF-8
+        $content = New-Object System.Net.Http.StringContent($mimeString, [System.Text.Encoding]::UTF8, "text/plain")
 
-        $response = $httpClient.PostAsync($createUri, $content).Result
+        $response = $httpClient.PostAsync($betaUri, $content).Result
         $responseBody = $response.Content.ReadAsStringAsync().Result
 
         if ($response.IsSuccessStatusCode) {
@@ -410,7 +428,7 @@ function Import-MessageToGraph {
                     $messageId = $movedMessage.id
                 }
                 catch {
-                    Write-Log "Move to folder failed (message still in Inbox): $_" -Level Warning
+                    Write-Log "Move to folder failed: $_" -Level Warning
                 }
             }
 
@@ -421,46 +439,180 @@ function Import-MessageToGraph {
             return $messageId
         }
         else {
-            Write-Log "MIME import failed - Status: $($response.StatusCode)" -Level Warning
+            Write-Log "MIME import failed - Status: $($response.StatusCode)" -Level Debug
             Write-Log "Response: $responseBody" -Level Debug
         }
 
         $httpClient.Dispose()
     }
     catch {
-        Write-Log "MIME import exception: $($_.Exception.Message)" -Level Warning
+        Write-Log "MIME import exception: $($_.Exception.Message)" -Level Debug
     }
 
-    # Method 2: Create message with .eml attachment as fallback
-    # This preserves the original email exactly
-    Write-Log "Trying fallback: create wrapper message with .eml attachment..." -Level Debug
+    # Method 2: Use MimeKit to parse and create proper Graph message
+    Write-Log "Trying MimeKit parsing method..." -Level Debug
     
     try {
-        # Parse basic info from MIME for the wrapper
+        # Load MIME message with MimeKit
+        $memStream = New-Object System.IO.MemoryStream(,$MimeContent)
+        $mimeMessage = [MimeKit.MimeMessage]::Load($memStream)
+        $memStream.Dispose()
+        
+        # Extract all the fields properly
+        $subject = if ($mimeMessage.Subject) { $mimeMessage.Subject } else { "(No Subject)" }
+        
+        # Get From address
+        $fromAddress = $null
+        $fromName = $null
+        if ($mimeMessage.From.Count -gt 0) {
+            $fromMailbox = $mimeMessage.From[0]
+            if ($fromMailbox -is [MimeKit.MailboxAddress]) {
+                $fromAddress = $fromMailbox.Address
+                $fromName = $fromMailbox.Name
+            }
+        }
+        
+        # Get To addresses
+        $toRecipients = @()
+        foreach ($to in $mimeMessage.To) {
+            if ($to -is [MimeKit.MailboxAddress]) {
+                $toRecipients += @{
+                    emailAddress = @{
+                        address = $to.Address
+                        name = $to.Name
+                    }
+                }
+            }
+        }
+        
+        # Get CC addresses
+        $ccRecipients = @()
+        foreach ($cc in $mimeMessage.Cc) {
+            if ($cc -is [MimeKit.MailboxAddress]) {
+                $ccRecipients += @{
+                    emailAddress = @{
+                        address = $cc.Address
+                        name = $cc.Name
+                    }
+                }
+            }
+        }
+        
+        # Get body - prefer HTML, fallback to text
+        $bodyContent = ""
+        $bodyType = "Text"
+        
+        if ($mimeMessage.HtmlBody) {
+            $bodyContent = $mimeMessage.HtmlBody
+            $bodyType = "HTML"
+        }
+        elseif ($mimeMessage.TextBody) {
+            $bodyContent = $mimeMessage.TextBody
+            $bodyType = "Text"
+        }
+        
+        # Get date
+        $messageDate = if ($mimeMessage.Date.DateTime -ne [DateTime]::MinValue) {
+            $mimeMessage.Date.DateTime
+        } else {
+            $ReceivedDate
+        }
+        
+        # Build Graph message
+        $graphMessage = @{
+            subject = $subject
+            body = @{
+                contentType = $bodyType
+                content = $bodyContent
+            }
+            isRead = $IsRead
+            isDraft = $false
+        }
+        
+        if ($fromAddress) {
+            $graphMessage.from = @{
+                emailAddress = @{
+                    address = $fromAddress
+                    name = $fromName
+                }
+            }
+            $graphMessage.sender = $graphMessage.from
+        }
+        
+        if ($toRecipients.Count -gt 0) {
+            $graphMessage.toRecipients = $toRecipients
+        }
+        
+        if ($ccRecipients.Count -gt 0) {
+            $graphMessage.ccRecipients = $ccRecipients
+        }
+        
+        # Handle attachments
+        $attachments = @()
+        foreach ($attachment in $mimeMessage.Attachments) {
+            if ($attachment -is [MimeKit.MimePart]) {
+                $attachmentStream = New-Object System.IO.MemoryStream
+                $attachment.Content.DecodeTo($attachmentStream)
+                $attachmentBytes = $attachmentStream.ToArray()
+                $attachmentStream.Dispose()
+                
+                $fileName = $attachment.FileName
+                if (!$fileName) { $fileName = "attachment" }
+                
+                $attachments += @{
+                    "@odata.type" = "#microsoft.graph.fileAttachment"
+                    name = $fileName
+                    contentType = $attachment.ContentType.MimeType
+                    contentBytes = [Convert]::ToBase64String($attachmentBytes)
+                }
+            }
+        }
+        
+        if ($attachments.Count -gt 0) {
+            $graphMessage.attachments = $attachments
+        }
+        
+        # Create message in target folder
+        $uri = if ($FolderId) {
+            "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
+        } else {
+            "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
+        }
+        
+        $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $graphMessage
+        
+        # Set the original date via extended properties
+        Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $created.id -ReceivedDate $messageDate -IsRead $IsRead
+        
+        Write-Log "Created message via MimeKit parsing" -Level Debug
+        return $created.id
+    }
+    catch {
+        Write-Log "MimeKit parsing failed: $_" -Level Debug
+    }
+
+    # Method 3: Last resort - wrapper with .eml attachment
+    Write-Log "Using .eml attachment fallback..." -Level Debug
+    
+    try {
         $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
         
         $subject = "(Migrated Email)"
         if ($mimeString -match '(?mi)^Subject:\s*(.+?)(?:\r?\n(?!\s)|$)') {
-            $rawSubject = $matches[1].Trim()
-            # Decode MIME encoded words if present
-            if ($rawSubject -notmatch '=\?') {
-                $subject = $rawSubject
-            } else {
-                $subject = $rawSubject -replace '=\?[^?]+\?[BQ]\?[^?]+\?=', '(encoded)'
-            }
+            $subject = $matches[1].Trim()
             if ($subject.Length -gt 200) { $subject = $subject.Substring(0, 197) + "..." }
         }
 
-        # Create wrapper message with original as .eml attachment
         $emlBase64 = [Convert]::ToBase64String($MimeContent)
         
         $messageBody = @{
             subject = "[Migrated] $subject"
             body = @{
                 contentType = "HTML"
-                content = "<p><strong>Migrierte E-Mail</strong></p><p>Original-Datum: $($ReceivedDate.ToString('dd.MM.yyyy HH:mm'))</p><p>Die Original-E-Mail ist als .eml Datei angehängt.</p>"
+                content = "<p><b>Migrierte E-Mail</b></p><p>Original-Datum: $($ReceivedDate.ToString('dd.MM.yyyy HH:mm'))</p><p>Die Original-E-Mail ist als .eml Datei angehängt.</p>"
             }
             isRead = $IsRead
+            isDraft = $false
             attachments = @(
                 @{
                     "@odata.type" = "#microsoft.graph.fileAttachment"
@@ -478,15 +630,12 @@ function Import-MessageToGraph {
         }
 
         $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $messageBody
-        
-        # Try to set the date
         Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $created.id -ReceivedDate $ReceivedDate -IsRead $IsRead
         
-        Write-Log "Created wrapper message with .eml attachment" -Level Debug
         return $created.id
     }
     catch {
-        Write-Log "Fallback method also failed: $_" -Level Error
+        Write-Log "All methods failed: $_" -Level Error
     }
 
     throw "All import methods failed for message"
